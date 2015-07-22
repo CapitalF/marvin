@@ -1,0 +1,18 @@
+# marvin bash auto-completion
+# Last updated for marvin v1.0 (20150721)
+# Add this text to your ~/.bash_completion file.
+
+_marvin()
+{
+	local cur prev opts base APPDIR SQLDBFILE SQLCMD LIST_INSTALLS
+	COMPREPLY=()
+	cur="${COMP_WORDS[COMP_CWORD]}"
+	prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+	opts="start stop restart status update update-validate console setup"
+
+	COMPREPLY=($(compgen -W "${opts}" -- ${cur}))
+	return 0
+}
+complete -F _marvin marvin
+

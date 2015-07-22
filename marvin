@@ -1,0 +1,982 @@
+#!/bin/bash
+#
+# marvin, a very simple Don't Starve Together server manager.
+# v1.0, 20150721
+#
+# --
+# IMPORTANT: We don't set our own PATH here. Make sure your environment has a reasonable PATH.
+# --
+INSTALL_DIR=~/dontstarvetogether # This is where we will install our server and related files.
+CONFIG_DNAME=config # The name of the config dir. We use this instead of "~/.klei".
+CONFIG_DIR=$INSTALL_DIR/$CONFIG_DNAME # The fully qualified path to the config directory.
+# --
+BINDIR=$INSTALL_DIR/bin # The directory where we can find the executable server binary/script.
+APPBIN=dontstarve_dedicated_server_nullrenderer # The file name of the server binary/script.
+PIDFILE=$INSTALL_DIR/server.pid # The process ID file.
+# --
+STEAMCMD_DIR=~/bin/steamcmd # where we will install SteamCMD.
+STEAMCMD_BIN=$STEAMCMD_DIR/steamcmd.sh # The name of the SteamCMD binary/script.
+SERVER_APPID=343050 # The SteamCMD Application ID.
+# --
+STOPCOUNTDOWN=10 # Number of seconds to give players shutdown warning in-game.
+STOPWAITFOR=7 # Number of seconds to wait for a server to quit normally before we violently kill it.
+UPDATETRIES=3 # How many times to attempt to update before we give up.
+# --
+MYNAME=$(basename $0)
+MYSELF=$(readlink -f $0)
+RUNID=$(date +%Y%m%d%H%M%S)-$$
+MYPID=$$
+NICECMD="nice -n 11 ionice -c 2 -n 6"
+TMUX_SESSION_ID=DST-server
+UPDATE_LOCKFILE=$INSTALL_DIR/update.lock
+# --
+
+echoerr() {
+	# Print errors to stderr.
+	echo "$@" 1>&2;
+	if [[ -n "$SEEN_ERROR" ]] ; then declare -r SEEN_ERROR=1 ; fi # If we saw any errors, set SEEN_ERROR=1, for later use.
+}
+
+f_cleanuptrap() {
+	# Cleanup trap.
+	#
+	unset MYPID_CHILDREN
+	local MYPID_CHILDREN MYPID_BAD_CHILDREN X_CKILL_TIMEOUT
+	#
+	echoerr ""
+	echoerr "Caught signal."
+	#
+	# Find and kill off all child processes which might be running.
+	MYPID_CHILDREN=$(pgrep -P $MYPID 2> /dev/null)
+	if [[ -n "$MYPID_CHILDREN" ]] ; then
+		# echoerr "DEBUG: Killing child processes: $(echo $MYPID_CHILDREN | tr -d "\n")"
+		for EACH in $MYPID_CHILDREN ; do
+			kill "$EACH" &> /dev/null
+		done ; unset EACH
+	fi
+	#
+	echoerr -n "Cleaning up: "
+	# Remove the update lock file, if we need to, and if it is there
+	if [[ "$UPDATING" == 1 ]] ; then # Cleanup during an update.
+		[[ -f "$UPDATE_LOCKFILE" ]] && rm -f "$UPDATE_LOCKFILE" &> /dev/null
+		f_lockdownmaster # Lock the master after an aborted update.
+	fi
+	#
+	# We should restore the tty line settings, because traping while at a read prompt can cause problems for the user terminal.
+	# This turned out to be a bash bug: https://lists.gnu.org/archive/html/help-bash/2014-06/msg00006.html
+	if [[ -n "$TTY_LINE_SETTINGS" ]] ; then
+		# echoerr "DEBUG: Restored stty line settings."
+		stty "$TTY_LINE_SETTINGS"
+	fi
+	#
+	echoerr "Done"
+	echoerr ""
+}
+
+f_getpid() {
+	# Get the current PID, if there is one, and record the server's operational status.
+	# Operational status (RUN_STATUS) can be one of "running", "stopped", "crashed", or "error".
+	# We return exit 1 on error, otherwise 0.
+	# f_getpid should never send stdout or stderr, unless debugging.
+	#
+	unset SERVER_PID RUN_STATUS
+	#
+	# We should know where to look up the PIDFILE. If we don't, that's a serious problem.
+	if [[ -z "$PIDFILE" ]] ; then
+		# echoerr "DEBUG: Call to obtain PID, but PIDFILE not set."
+		SERVER_PID=""
+		RUN_STATUS="error"
+		return 1
+	fi
+	# Bad things that could possibly happen include the PID file being missing, the process being missing, or the tmux session being missing.
+	if [[ -r "$PIDFILE" ]] ; then
+		SERVER_PID=$(cat $PIDFILE | egrep -m 1 -o "^[0-9]+$" )
+		# Make sure the process is not crashed.
+		if [[ -n "$SERVER_PID" ]] && [[ -n "$(ps --no-headers -p $SERVER_PID -o pid)" ]] ; then
+			RUN_STATUS="running"
+		else
+			# SERVER_PID=""
+			RUN_STATUS="crashed"
+		fi
+	# It is also possible that the PIDFILE is missing, but the tmux session is running. The process may or may not also be running.
+	# In theory, the only time this should happen is when the server is just starting up, or if the server process has failed.
+	elif ( tmux has-session -t $TMUX_SESSION_ID 2> /dev/null ) ; then
+		# echoerr "DEBUG: TMUX session exists, but there is no PIDFILE."
+		SERVER_PID=""
+		RUN_STATUS="error"
+		return 1
+	# If there is no PIDFILE and no tmux session, then it's good to assume that the server is stopped.
+	else
+		SERVER_PID=""
+		RUN_STATUS="stopped"
+	fi
+}
+
+f_quitifrunning() {
+	# For certain activities, we don't want to proceed if the server is actively running.
+	# We set RUNQUIT=1, and the parent func uses that to exit/return as needed.
+	#
+	unset RUNQUIT
+	local X_GETPID
+	#
+	f_getpid ; X_GETPID="$?"
+	if [[ "$RUN_STATUS" == "stopped" ]] ; then
+		return 0
+	elif [[ "$RUN_STATUS" == "running" ]] ; then
+		RUNQUIT=1
+		echoerr ""
+		echoerr "ERROR: The server is already running."
+		echoerr "  Unable to continue."
+		echoerr ""
+		return 1
+	elif [[ "$RUN_STATUS" == "crashed" ]] ; then
+		RUNQUIT=1
+		echoerr ""
+		echoerr "ERROR: The server appears to have crashed."
+		echoerr "  Recommended course of action is to remove the PID file after making sure the process is really dead."
+		echoerr "  You may also run the \"$MYNAME stop\" command, and the situation should get cleaned up automatically."
+		echoerr "  PIDFILE=$PIDFILE, PID: $SERVER_PID"
+		echoerr "  Unable to continue."
+		echoerr ""
+		return 1
+	else
+		RUNQUIT=1
+		echoerr ""
+		echoerr "ERROR: Unable to get the server's current operational status."
+		echoerr "  This may be a temporary error, or because the process has failed."
+		echoerr "  Unable to continue."
+		echoerr ""
+		return 1
+	fi
+}
+
+f_start() {
+	# Start the server.
+	#
+	f_quitifrunning # Do not proceed if the server is already running.
+	if [[ "$RUNQUIT" == 1 ]] ; then return 1 ; fi
+	#
+	# Validate that APPBIN is valid.
+	if [[ ! -x "$BINDIR/$APPBIN" ]] ; then
+		echoerr ""
+		echoerr "ERROR: The APPBIN, \"$APPBIN\"is not executable or can not be found."
+		echoerr ""
+		return 1
+	fi
+	# Check for an update lock.
+	f_lockcheck
+	if [[ "$LOCKFAIL" == 1 ]] ; then return 1 ; fi
+	#
+	# If the server has no settings.ini, don't start!
+	if ! [[ -f "$CONFIG_DIR/settings.ini" ]] ; then
+		echoerr ""
+		echoerr "ERROR: There is no settings.ini file!"
+		echoerr "  This probably means the server is new and not configured. You should create a settings.ini file."
+		echoerr "  See the wiki for help:  http://dont-starve-game.wikia.com/wiki/Guides/Don’t_Starve_Together_Dedicated_Servers"
+		echoerr "  Your settings.ini file should go here: $CONFIG_DIR/settings.ini"
+		echoerr ""
+		return 1
+	fi
+	#
+	# Continue if sane.
+	#
+	# Execute the server.
+	cd $BINDIR &> /dev/null
+	tmux new-session -d -s $TMUX_SESSION_ID "$BINDIR/$APPBIN -persistent_storage_root $INSTALL_DIR -conf_dir $CONFIG_DNAME -console" ; X_TMUXSTART=$?
+	#
+	# We set tmux remain-on-exit on here so that if the APPBIN dies on startup, we can capture a console log.
+	#   Without this, tmux would close the session and we would have no idea what went wrong.
+	#   Note that if tmux closes really fast, you might need to add a sleep 1 to the end of the new-session command.
+	tmux set-window-option -t $TMUX_SESSION_ID:0 remain-on-exit on &> /dev/null
+	#
+	echo ""
+	# Check the tmux exit code for errors.
+	if [[ $X_TMUXSTART -ne 0 ]] ; then
+		echoerr "ERROR: tmux failed to run or experienced an error."
+		echoerr "  tmux exit code $X_TMUXSTART."
+		echoerr "  Startup failed."
+		echoerr ""
+		return 1
+	fi
+	#
+	# --
+	# Since the app itself can not yet write a PID file, we need to get it via tmux, but we must wait for the process to start.
+	# WARNING: Do not add any other commands to the tmux new-session command or this won't work correctly. Arguments are okay.
+	until [[ -n "$GETPID_TMUX" ]] ; do
+		GETPID_TMUX=$(tmux list-panes -t "$TMUX_SESSION_ID" -F '#{pane_pid}')
+		sleep 1
+	done
+	echo "$GETPID_TMUX" >> $PIDFILE || { echoerr "" ; echoerr "ERROR: Unable to write PIDFILE: $PIDFILE !" ; f_stop ; exit 1 ; }
+	# Note that this waiting here does not currently make sense due to getting the PID from tmux.
+	# When the application has a -pidfile option, this will be needed. Keep this.
+	# --
+	#
+	# Need to wait for the PIDFILE to be written, but tmux returns immediately.
+	# We will wait until the PIDFILE is written. Sometimes this can take many seconds.
+	if [[ -z "$(cat "$PIDFILE" 2> /dev/null)" ]] ; then # NOTE: We won't even hit this if the PIDFILE is written really fast (unlikely).
+		echo -n "Starting server:"
+		declare -i STARTWAITCOUNT=0
+		until [[ -n "$(cat "$PIDFILE" 2> /dev/null)" ]] ; do
+			# Check if the tmux pane died early. This is a sign that the APPBIN quit.
+			if [[ "$(tmux list-panes -t "$TMUX_SESSION_ID" -F '#{pane_dead}' 2> /dev/null)" == 1 ]] ; then
+				STARTUP_CAPTURE_PANE_FILE="$INSTALL_DIR/crash_capture-pane_$(date +%Y%m%d%H%M%S)-$$.log"
+				echoerr ""
+				echoerr "ERROR: The server quit before the PIDFILE was written."
+				echoerr "  We will capture the console output to file."
+				echoerr "  Capture file: $STARTUP_CAPTURE_PANE_FILE"
+				echoerr ""
+				tmux capture-pane "$TMUX_CAPTURE_OPTS" -t "$TMUX_SESSION_ID":0.0 \; save-buffer "$STARTUP_CAPTURE_PANE_FILE"
+				tmux kill-session -t "$TMUX_SESSION_ID"
+				break
+			fi
+			# Check if the session has disappeared. This should not happen if "remain-on-exit on" has been set.
+			if ! ( tmux has-session -t $TMUX_SESSION_ID 2> /dev/null ) ; then
+				echoerr ""
+				echoerr "ERROR: The tmux session has disappeared before the PIDFILE was written."
+				echoerr "  There may be a problem with tmux, or the server died very quickly."
+				echoerr ""
+				break
+			fi
+			# Our timeout counter.
+			STARTWAITCOUNT=$(( $STARTWAITCOUNT + 1))
+			if [[ "$STARTWAITCOUNT" -gt 15 ]] ; then
+				echoerr ""
+				echoerr "ERROR: Done waiting. Startup may have failed. Check status."
+				echoerr ""
+				break
+			fi
+			sleep 1
+			echo -n "."
+		done ; unset STARTWAITCOUNT STARTUP_CAPTURE_PANE_FILE
+		echo "Done"
+	fi
+	#
+	# Since the server has started, we can allow tmux to kill sessions when they die again.
+	tmux set-window-option -t $TMUX_SESSION_ID:0 remain-on-exit off &> /dev/null
+	#
+	# Now that the PIDFILE should be readable, get the PID
+	f_getpid
+	if [[ -n "$SERVER_PID" ]] ; then
+		echo "Server started at PID $SERVER_PID."
+	fi
+	# Renice the process to make sure it runs as smooth as possible.
+	# This requires pam_limits configuration via /etc/security/limits.conf
+	if [[ -n "$SERVER_PID" ]] && (egrep "$USER.*nice" /etc/security/limits.conf &> /dev/null) ; then
+		echo -n "Renicing server process: "
+		renice -n -9 "$SERVER_PID" 1> /dev/null ; X_RENICE=$?
+		if [[ ! "$X_RENICE" = 0 ]] ; then
+			echoerr ""
+			echoerr "Raising the priority of the game server process failed."
+			echoerr "This might be due to pam_limits not being configured correctly, or the process is gone."
+			echoerr ""
+		fi
+		echo "Done"
+	fi
+	echo "Start completed."
+	echo ""
+}
+
+f_stop() {
+	# Stop the running server.
+	# 
+	unset STOPFAIL
+	local X_GETPID
+	#
+	STOPFAIL=0
+	f_getpid ; X_GETPID="$?"
+	if [[ "$RUN_STATUS" == "running" ]] ; then
+		echo ""
+		# Give players warning that the server is going down, unless we are in a rush.
+		if ! [[ "$STOPNOW" == yes ]] ; then
+			STOPCOUNT=$STOPCOUNTDOWN
+			echo -n "Giving players $STOPCOUNT seconds warning: "
+			until [[ "$STOPCOUNT" -eq 0 ]] ; do
+				echo -n "."
+				tmux send-keys -t "$TMUX_SESSION_ID" C-m "c_announce(\"The server is shutting down in $STOPCOUNT seconds!\")" C-m
+				STOPCOUNT=$(( $STOPCOUNT - 1))
+				sleep 1
+			done ; unset STOPCOUNT
+			echo "Done"
+		else
+			# Stop more or less immediately.
+			echo "Stopping now, without warning to players."
+		fi
+		# When countdown is done, send quit command
+		tmux send-keys -t "$TMUX_SESSION_ID" C-m "c_shutdown(true)" C-m
+		# Now verify that the process is actually gone via the PID.
+		if [[ $(ps --no-headers -p "$SERVER_PID" -o pid | wc -l) -gt 0 ]] ; then
+			echo -n "Waiting for server to stop: "
+			declare -i STOPWAITCOUNT=0
+			while [[ $(ps --no-headers -p "$SERVER_PID" -o pid | wc -l) -gt 0 ]] ; do
+				STOPWAITCOUNT=$(( $STOPWAITCOUNT + 1))
+				if [[ "$STOPWAITCOUNT" -gt "$STOPWAITFOR" ]] ; then
+					echo ""
+					echo "Giving up waiting after $STOPWAITFOR seconds. Stop may have failed."
+					echo ""
+					echo "Here's the process info:"
+					ps uw -p "$SERVER_PID"
+					echo ""
+					echo -n "Sending SIGQUIT to the process: "
+					kill -SIGQUIT "$SERVER_PID"
+					echo "Done"
+					STOPFAIL=1
+					break
+				fi
+				sleep 1
+				echo -n "."
+			done ; unset STOPWAITCOUNT
+			echo "Done"
+		fi
+		#
+		# Kill the tmux session too. If necessary.
+		if ( tmux has-session -t "$TMUX_SESSION_ID" 2> /dev/null ) ; then
+			echo -n "Waiting for tmux session to die: "
+			declare -i TMUXDIEWAITCOUNT=0
+			while ( tmux has-session -t "$TMUX_SESSION_ID" 2> /dev/null ) ; do
+				TMUXDIEWAITCOUNT=$(( $TMUXDIEWAITCOUNT + 1))
+				if [[ "$TMUXDIEWAITCOUNT" -gt 5 ]] ; then
+					echo ""
+					echo "Giving up waiting for tmux session to die."
+					echo -n "  I am going to kill the tmux session, which should kill everything: "
+					tmux kill-session -t "$TMUX_SESSION_ID"
+					echo "Done"
+					STOPFAIL=1
+					break
+				fi
+				sleep 1
+				echo -n "."
+			done ; unset TMUXDIEWAITCOUNT
+			echo "Done"
+		fi
+		# Remove the PID file.
+		test -f $PIDFILE && rm -f "$PIDFILE" || { echoerr "ERROR: Failed to remove PIDFILE!" ; STOPFAIL=1 ; }
+		if [[ "$STOPFAIL" == 0 ]] ; then
+			echo "The server stopped successfully."
+		else
+			echoerr "The server stop request encountered errors."
+		fi
+		echo ""
+	elif [[ "$RUN_STATUS" == "stopped" ]] ; then
+		echo ""
+		echo "The server is already stopped. Nothing to do."
+		echo ""
+	elif [[ "$RUN_STATUS" == "crashed" ]] ; then
+		echoerr ""
+		echoerr "WARNING: The server appears to be crashed."
+		echoerr "  PIDFILE=\"$PIDFILE\", bogus PID is \"$SERVER_PID\"."
+		echoerr "  Since you requested a stop, I will remove the old PIDFILE automatically."
+		echoerr ""
+		if [[ -f "$PIDFILE" ]] ; then
+			# If the PIDFILE exists, delete it.
+			rm -f "$PIDFILE" || echoerr "ERROR: Unable to remove PIDFILE!"
+		fi
+		if ( tmux has-session -t "$TMUX_SESSION_ID" 2> /dev/null ) ; then
+			# If the tmux session exists, kill it.
+			tmux kill-session -t "$TMUX_SESSION_ID" &> /dev/null
+		fi
+	else
+		echoerr ""
+		echoerr "ERROR: Unable to get the server's current operational status."
+		echoerr "  This may be a temporary error (startup), or because the server has crashed."
+		echoerr "  Since you requested a stop, I will attempt to perform a forceful shutdown and cleanup."
+		echoerr ""
+		if [[ -f "$PIDFILE" ]] ; then
+			# If the PIDFILE exists, delete it.
+			rm -f "$PIDFILE" || echoerr "ERROR: Unable to remove PIDFILE!"
+		fi
+		if ( tmux has-session -t "$TMUX_SESSION_ID" 2> /dev/null ) ; then
+			# If the tmux session exists, kill it.
+			tmux kill-session -t "$TMUX_SESSION_ID" &> /dev/null
+		fi
+		echoerr "Cleanup completed."
+		echoerr ""
+	fi
+}
+
+f_status() {
+	# Display the status of the server.
+	# 
+	local PROCINFO_ARGS PROCINFO_PCPU PROCINFO_PPRIO PROCINFO_PSR PROCINFO_EUSER PROCINFO_RSS PROCINFO_VSZ PROCINFO_LSTART PROCINFO_ETIME PROCINFO_CPUTIME
+	#
+	f_getpid ; X_GETPID="$?"
+	if [[ "$RUN_STATUS" == "running" ]] ; then
+		echo ""
+		echo "Showing server status... "
+		echo ""
+		echo "tmux session: $(tmux list-sessions | egrep "^ *$TMUX_SESSION_ID: ")"
+		echo ""
+		echo "Game server PID: $SERVER_PID"
+		echo ""
+		PROCINFO_ARGS=$(ps --no-headers -p $SERVER_PID -o args)
+		echo "Process command arguments (from ps): "
+		echo "$PROCINFO_ARGS"
+		echo ""
+		echo "Various ps stats:"
+		#
+		PROCINFO_PCPU=$(ps --no-headers -p $SERVER_PID -o pcpu)
+		PROCINFO_PPRIO=$(ps --no-headers -p $SERVER_PID -o pri | sed -e "s/ \{1,\}//g")
+		PROCINFO_PSR=$(ps --no-headers -p $SERVER_PID -o psr | sed -e "s/ \{1,\}//g")
+		PROCINFO_EUSER=$(ps --no-headers -p $SERVER_PID -o euser)
+		PROCINFO_RSS=$(ps --no-headers -p $SERVER_PID -o rss)
+		PROCINFO_VSZ=$(ps --no-headers -p $SERVER_PID -o vsz)
+		PROCINFO_LSTART=$(ps --no-headers -p $SERVER_PID -o lstart)
+		PROCINFO_ETIME=$(ps --no-headers -p $SERVER_PID -o etime | sed -e "s/ \{1,\}//g")
+		PROCINFO_CPUTIME=$(ps --no-headers -p $SERVER_PID -o cputime)
+		#
+		( echo "  CPU usage percent per-core:|$PROCINFO_PCPU%"
+		echo "  Process priority (normal=19, higher=better):|$PROCINFO_PPRIO"
+		echo "  Running on processor core:|$PROCINFO_PSR"
+		echo "  Running as effective user:|$PROCINFO_EUSER"
+		echo "  RSS/Real memory usage:|$PROCINFO_RSS KB"
+		echo "  VSZ/Virtual memory usage:|$PROCINFO_VSZ KB"
+		echo "  Process started at:|$PROCINFO_LSTART"
+		echo "  Process started elapsed-time ago:|$PROCINFO_ETIME"
+		echo "  Process CPU in-use time:|$PROCINFO_CPUTIME"
+		) | column -t -s "|"
+		echo ""
+		echo "lsof says the following network sockets are in use by PID $SERVER_PID:"
+		lsof -i -n -a -p $SERVER_PID | column -t
+		echo ""
+		echo "Done"
+	elif [[ "$RUN_STATUS" == "stopped" ]] ; then
+		echo ""
+		echo "Server not running."
+		echo ""
+	elif [[ "$RUN_STATUS" == "crashed" ]] ; then
+		echoerr ""
+		echoerr "WARNING: The server appears to be crashed."
+		echoerr "  Recommended course of action is to stop the server to force a cleanup."
+		echoerr ""
+	else
+		echoerr ""
+		echoerr "WARNING: Unable to determine the status of the server."
+		echoerr "  This might be a temporary problem. Try again?"
+		echoerr ""
+	fi
+}
+
+f_update_steamcmd() {
+	# Update with SteamCMD/SteamPipe
+	# Note that we don't do any lock checking here. f_update does that.
+	#
+	local STEAMCMD_UPDATE_COUNTER UPDATEARG EVALTXT_STEAMCMD_UPDATE_CMD X_UPDATE_STEAMCMD
+	#
+	echo ""
+	#
+	# If SteamCMD is not found, there is nothing we can do.
+	if [[ ! -x "$STEAMCMD_BIN" ]] ; then
+		echoerr "ERROR: Unable to find the SteamCMD installation."
+		echoerr ""
+		return 2
+	fi
+	if [[ -z "$SERVER_APPID" ]] ; then
+		echoerr "ERROR: Request to update with SteamCMD, but we have no APPID to work with."
+		echoerr ""
+		return 2
+	fi
+	if [[ "$VERIFYUPDATE" == "1" ]] ; then
+		UPDATEARG="+app_update $SERVER_APPID validate"
+		# echoerr "DEUBG: Updating with SteamCMD validate"
+	else
+		UPDATEARG="+app_update $SERVER_APPID"
+		# echoerr "DEBUG: Updating with SteamCMD"
+	fi
+	# cd to the INSTALL_DIR, so steamcmd doesn't litter crap wherever $PWD happens to be.
+	cd $INSTALL_DIR
+	#
+	EVALTXT_STEAMCMD_UPDATE_CMD="$NICECMD $STEAMCMD_BIN +@ShutdownOnFailedCommand 1 +login \"anonymous\" +force_install_dir $INSTALL_DIR/ $UPDATEARG +exit"
+	echo "SteamCMD running command: "
+	echo "  $EVALTXT_STEAMCMD_UPDATE_CMD"
+	echo ""
+	#
+	declare -i STEAMCMD_UPDATE_COUNTER="0"
+	while true ; do
+		eval $EVALTXT_STEAMCMD_UPDATE_CMD ; X_UPDATE_STEAMCMD=$?
+		STEAMCMD_UPDATE_COUNTER=$(( $STEAMCMD_UPDATE_COUNTER + 1)) # Increment the counter
+		# echo "" # SteamCMD seems to add a blank line after exit anyway.
+		echo "SteamCMD exit code: $X_UPDATE_STEAMCMD"
+		if [[ "$X_UPDATE_STEAMCMD" = 0 ]] ; then
+			echo "SteamCMD completed successfully."
+			echo ""
+			break
+		else
+			if [[ "$STEAMCMD_UPDATE_COUNTER" -lt "$UPDATETRIES" ]] ; then
+				echo "SteamCMD attempt $STEAMCMD_UPDATE_COUNTER failed, will try again."
+				echo ""
+				sleep 0
+				continue
+			fi
+			if [[ "$STEAMCMD_UPDATE_COUNTER" -eq "$UPDATETRIES" ]] ; then
+				echoerr "SteamCMD failed $STEAMCMD_UPDATE_COUNTER times. Giving up."
+				echoerr ""
+				return 1
+			fi
+		fi
+	done ; unset STEAMCMD_UPDATE_COUNTER X_UPDATE_STEAMCMD
+}
+
+f_update() {
+	# Update the server
+	#
+	unset UPDATER_FAIL UPDATING
+	local X_UPDATER X_UPDATE_SETLOCK X_UPDATE_RMLOCK X_LOCKMASTER AUTOUPDATE_POSTCHECK_RETRIES=3 AUTOUPDATE_SLEEP2=10
+	#
+	# Lockfile pre-check and set
+	f_lockcheck
+	if [[ "$LOCKFAIL" == 1 ]] ; then return 1 ; fi
+	#
+	UPDATING=1
+	echo "$MYPID" >> $UPDATE_LOCKFILE ; X_UPDATE_SETLOCK="$?"
+	if [[ ! "$X_UPDATE_SETLOCK" == 0 ]] ; then
+		echoerr ""
+		echoerr "ERROR: Unable to write lockfile for update!"
+		echoerr ""
+		UPDATING=0
+		return 1
+	fi
+	#
+	while true ; do
+		f_update_steamcmd ; X_UPDATER="$?"
+		#
+		# Now that we ran the updater, we need to verify that it worked, and if it didn't try again or fail out.
+		# Remember that our updater itself may retry internally, so this may be redundant.
+		#   Sometimes the Steam Cloud content depots are out of date when updates get released, or Steam services are down/broken. 
+		#   Often, waiting a little while fixes the issue.
+		#
+		UPDATE_POSTCHECK_COUNTER=$(( $UPDATE_POSTCHECK_COUNTER + 1)) # Increment the counter
+		#
+		if [[ "$X_UPDATER" == 2 ]] ; then
+			# X_UPDATER=2 is a permanant error. Retrying won't help. Give up immediately.
+			UPDATER_FAIL=1
+			break
+		elif [[ "$X_UPDATER" == 1 ]] ; then
+			# X_UPDATER=1 is a soft error. Trying again might result in success.
+			if [[ "$UPDATE_POSTCHECK_COUNTER" -lt "$AUTOUPDATE_POSTCHECK_RETRIES" ]] ; then
+				echo "Updater try $UPDATE_POSTCHECK_COUNTER failed. Will try again in $AUTOUPDATE_SLEEP2 seconds."
+				echo ""
+				sleep "$AUTOUPDATE_SLEEP2"
+				continue
+			else
+				UPDATER_FAIL=1
+				echoerr "ERROR: Updater tried $UPDATE_POSTCHECK_COUNTER times already. Will not try again."
+				echoerr ""
+				break
+			fi
+		elif [[ "$X_UPDATER" == 0 ]] ; then
+			UPDATER_FAIL=0
+			break
+		fi
+		#
+	done ; unset UPDATE_POSTCHECK_COUNTER
+	#
+	# Set reasonable file permissions because SteamCMD does not.
+	echo -n "Setting file attributes... "
+	$NICECMD find $INSTALL_DIR -type f -exec chmod ugo-x '{}' + # Remove all file execute bits.
+	$NICECMD chmod ugo+x $BINDIR/dontstarve
+	$NICECMD chmod ugo+x $BINDIR/dontstarve_dedicated_server_nullrenderer
+	echo "Done" ; echo ""
+	#
+	UPDATING=0
+	# Remove lockfile
+	rm -f $UPDATE_LOCKFILE ; X_UPDATE_RMLOCK="$?"
+	if [[ ! "$X_UPDATE_RMLOCK" == 0 ]] ; then
+		echoerr "ERROR: Unable to remove lockfile post-update!"
+		echoerr ""
+		return 1
+	fi
+	#
+	if [[ "$UPDATER_FAIL" == 1 ]] ; then
+		echoerr "The updater failed. Please see previous errors and warnings for more information."
+		echoerr ""
+		return 1
+	fi
+	echo "Update completed."
+	echo ""
+}
+
+f_lockcheck() {
+	# Check if a lock has been placed on the installation to prevent a train wreck.
+	#
+	if [[ -f "$UPDATE_LOCKFILE" ]] ; then
+		LOCKFAIL=1
+		echoerr ""
+		echoerr "ERROR: lockfile active. Check to see if some other process is working on this installation."
+		echoerr "  Lockfile: $UPDATE_LOCKFILE"
+		echoerr ""
+		return 1
+	fi
+}
+
+f_tmuxattach() {
+	# Attach to the tmux session (console).
+	#
+	local X_TMUXATTACH
+	#
+	# If we didn't get a valid TMUX_SESSION_ID, fail.
+	if [[ -z "$TMUX_SESSION_ID" ]] ; then
+		return 1
+	fi
+	echo ""
+	echo "Attaching to tmux session $TMUX_SESSION_ID: "
+	tmux attach-session -t "$TMUX_SESSION_ID" ; X_TMUXATTACH=$?
+	echo ""
+	return 0
+}
+
+f_setup() {
+	# Do the first-time setup. Dependency checks, creating the INSTALL_DIR, loading the DB, and similar requirements.
+	#
+	local DEPENDENCIES STEAMCMD_INSTALLER_URL
+	local X_MKDIR_INSTALL_DIR
+	#
+	echo ""
+	echo "This process will help you with the basic setup needed to get $MYNAME up and running."
+	echo ""
+	echo "If you have not already, be sure to read the ${MYNAME}_README.txt file. It contains important information."
+	#
+	# Dependency checks.
+	echo ""
+	echo "--"
+	echo ""
+	echo "$MYNAME requires a number of dependencies to run. We will try to verify them." 
+	echo ""
+	echo "VERIFICATION: Shall we continue?"
+	read -e -r -p "y/N: " -i "" REPLY
+	if [[ ! "$REPLY" == [yY] ]]; then
+		echo ""
+		echo "Quitting."
+		echo ""
+		return 0
+	fi
+	#
+	DEPENDENCIES="tmux wget lsof sed cat echo kill egrep mkdir chmod find cut tr ps wc rm basename date nice renice ionice pgrep"
+	for EACH in $DEPENDENCIES ; do
+		DEP_TARGET=$(type -p $EACH 2> /dev/null)
+		# Handle shell builtins too
+		if [[ -z "$DEP_TARGET" ]] && [[ "$(type $EACH)" == "$EACH is a shell builtin" ]]; then
+			DEP_TARGET="shell builtin"
+		fi
+		if [[ -z "$DEP_TARGET" ]] ; then
+			DEP_FAIL=1
+			DEP_TARGET="Not found."
+			DEP_STATUS="FAILURE!"
+		else
+			DEP_STATUS="Success"
+		fi
+		echo "Checking dependency \"$EACH\": Status: $DEP_STATUS : Path: $DEP_TARGET"
+	done ; unset EACH DEP_TARGET DEP_STATUS
+	echo ""
+	if [[ "$DEP_FAIL" == 1 ]] ; then
+		echoerr "ERROR: At least one dependency check failed. You will need to fix this before you can continue."
+		echoerr "  The ${MYNAME}_readme.txt file has useful information regarding fixing dependancies."
+		echoerr ""
+		echoerr "Quitting."
+		echoerr ""
+		return 1
+	else
+		echo "All dependencies verified successfully."
+	fi
+	echo ""
+	read -r -s -p "Press ENTER to continue." ; echo ""
+	#
+	# INSTALL_DIR check and creation.
+	echo ""
+	echo "--"
+	echo ""
+	echo "Now we will check if the configured INSTALL_DIR exists, and create it if necessary."
+	echo ""
+	# Test to see if INSTALL_DIR already exists.
+	if [[ -d "$INSTALL_DIR" ]] ; then
+		echo "INSTALL_DIR $INSTALL_DIR already exists. This is normal if performing an upgrade or re-install."
+		echo "  We will use this directory, and any installation it contains."
+		echo ""
+		echo "VERIFICATION: Shall we continue?"
+		read -e -r -p "y/N: " -i "" REPLY
+		if [[ ! "$REPLY" == [yY] ]]; then
+			echo ""
+			echo "Quitting."
+			echo ""
+			return 0
+		fi
+	else
+		echo "VERIFICATION: INSTALL_DIR not found. Shall we create it now?"
+		read -e -r -p "y/N: " -i "" REPLY
+		if [[ ! "$REPLY" == [yY] ]]; then
+			echo ""
+			echo "Quitting."
+			echo ""
+			return 0
+		fi
+		echo -n "Creating the INSTALL_DIR directory \"$INSTALL_DIR\": "
+		mkdir "$INSTALL_DIR" ; X_MKDIR_INSTALL_DIR=$?
+		if [[ "$X_MKDIR_INSTALL_DIR" == 0 ]] ; then
+			chmod u=wrx,g-rwx,o-wrx "$INSTALL_DIR" # Set perms.
+			echo "Done"
+		else
+			echo "Failure."
+			echo ""
+			echo "INSTALL_DIR creation attempt failed. This is probably because you don't have filesystem permission to do so."
+			echo ""
+			return 1
+		fi
+	fi
+	#
+	# Verify SteamCMD is installed where it should be.
+	echo ""
+	echo "--"
+	echo ""
+	echo "We will now verify that SteamCMD is installed, or install it if necessary."
+	echo ""
+	echo "VERIFICATION: Shall we continue?"
+	read -e -r -p "y/N: " -i "" REPLY
+	if [[ ! "$REPLY" == [yY] ]]; then
+		echo ""
+		echo "Quitting."
+		echo ""
+		return 0
+	fi
+	echo ""
+	if [[ -x "$STEAMCMD_BIN" ]] ; then
+		echo "SteamCMD found successfully: $STEAMCMD_BIN."
+	else
+		STEAMCMD_INSTALLER_URL="http://media.steampowered.com/installer/steamcmd_linux.tar.gz"
+		echo "SteamCMD not found. Do you want to install SteamCMD now?"
+		echo "  SteamCMD will be installed in $STEAMCMD_BIN"
+		echo ""
+		read -e -r -p "y/N: " -i "" REPLY
+		if [[ ! "$REPLY" == [yY] ]]; then
+			echo ""
+			echo "SteamCMD must be installed to use $MYNAME."
+			echo "Quitting."
+			echo ""
+			return 0
+		fi
+		# FIXME: This is junk. I got lazy. I'll fix it some day.
+		mkdir -p ~/bin/steamcmd || { echoerr "ERROR: Unable to create steamcmd dir!" ; return 1 ; }
+		wget --timeout=30 --tries=3 -O ~/bin/steamcmd/steamcmd_linux.tar.gz "$STEAMCMD_INSTALLER_URL" &> /dev/null || {
+			echoerr "ERROR: SteamCMD download failed. Try again later?" ; return 1 ; }
+		tar -xzf ~/bin/steamcmd/steamcmd_linux.tar.gz -C ~/bin/steamcmd/ || { echoerr "ERROR: Extracting the SteamCMD archive failed." ; return 1 ; }
+		#
+		# Verify that SteamCMD installed correctly.
+		if [[ ! -x "$STEAMCMD_BIN" ]] ; then
+			echoerr ""
+			echoerr "ERROR: SteamCMD install failed. Unable to execute."
+			echoerr ""
+			return 1
+		else
+			echo ""
+			echo "SteamCMD installed successfully."
+		fi
+	fi
+	echo ""
+	read -r -s -p "Press ENTER to continue." ; echo ""
+	#
+	# Install the server using SteamCMD
+	echo ""
+	echo "--"
+	echo ""
+	echo "We will now try to install the server file using SteamCMD."
+	echo ""
+	echo "VERIFICATION: Shall we continue?"
+	read -e -r -p "y/N: " -i "" REPLY
+	if [[ ! "$REPLY" == [yY] ]]; then
+		echo ""
+		echo "Quitting."
+		echo ""
+		return 0
+	fi
+	echo ""
+	f_update ; X_UPDATE_INSTALL=$?
+	if ! [[ "$X_UPDATE_INSTALL" == 0 ]] ; then
+		echoerr ""
+		echoerr "ERROR: The updater failed to install the server. Unable to continue."
+		echoerr ""
+		return 1
+	fi
+	#
+	# Create a config directory if needed.
+	if ! [[ -d "$CONFIG_DIR" ]] ; then
+		echo "Creating a config directory: $CONFIG_DIR"
+		mkdir $CONFIG_DIR
+	fi
+        echo ""
+        read -r -s -p "Press ENTER to continue." ; echo ""
+	#
+	# Bash auto-completion script notice.
+	echo ""
+	echo "--"
+	echo ""
+	echo "$MYNAME offers a bash-autocompletion script. This enables command tab-completion of command arguments."
+	echo "  On some system, you can simply append the contents of the bash-completion script to your ~/.bash_completion file."
+	echo "  Otherwise, just append the file contents to your bash profile (.profile, .bash_profile, etc)."
+	echo ""
+	read -r -s -p "Press ENTER to continue." ; echo ""
+	#
+	# Renice notice.
+	echo ""
+	echo "--"
+	echo ""
+	echo "$MYNAME can use nice/renice to change the process priority of the server."
+	echo "  Renicing the server process can prevent performance problems caused by local load."
+	echo "  Unfortunately, this requires administrator configuration in /etc/security/limits.conf."
+	echo "  You will need to manually configure this if you want your server processes to be reniced."
+	echo ""
+	read -r -s -p "Press ENTER to continue." ; echo ""
+	#
+	# cron items notice.
+	echo ""
+	echo "--"
+	echo ""
+	echo "  If you want your server to automatically start on system boot, add something like the following to your user cron tab:"
+	echo ""
+	echo '  @reboot       ~/bin/marvin start'
+	echo ""
+	read -r -s -p "Press ENTER to continue." ; echo ""
+	#
+	# Firewall notice.
+	echo ""
+	echo "--"
+	echo ""
+	echo "If you have a firewall (and you should), be sure to allow inbound and outbound traffic."
+	echo "  By default DST server uses UDP ports 10999, 27016, and 8766"
+	echo ""
+	read -r -s -p "Press ENTER to continue." ; echo ""
+	#
+	# All done.
+	echo ""
+	echo "--"
+	echo ""
+	echo "Setup completed!"
+	echo ""
+	echo "You should now configure your settings.ini file, and then try to start your server."
+	echo "  Your configuration directory is \"$CONFIG_DIR\"."
+	echo ""
+	return 0
+}
+
+f_help() {
+	# Print some basic help info.
+	SEEN_HELP=1
+	echoerr ""
+	echoerr "$MYNAME is a very simple Don't Starve Together dedicated server manager."
+	echoerr ""
+	echoerr "For more information, go here: "
+	echoerr "  http://forums.kleientertainment.com/topic/56384-marvin-a-simple-linux-dst-server-manager/"
+	f_commandusage
+}
+
+f_commandusage() {
+	# A quick print of valid commands.
+	#
+	echoerr ""
+	for EACH in $IN_PARAMS_VALID ; do
+		echoerr "  $MYNAME $EACH"
+	done ; unset EACH
+	if [[ ! "$SEEN_HELP" == 1 ]] ; then
+		echoerr ""
+		echoerr "Try \"$MYNAME help\" for more information."
+	fi
+	echoerr ""
+}
+
+#--
+
+# If we are running an interactive shell (not cron), then save the terminal settings in case we trap and need to restore them.
+# This is needed due to a bug in bash prior to 2015.
+if (tty &> /dev/null) ; then
+	# echo "DEBUG: Saved stty line settings."
+	TTY_LINE_SETTINGS="$(stty -g 2> /dev/null)"
+fi
+
+trap 'f_cleanuptrap ; exit 90' SIGHUP SIGQUIT SIGABRT SIGTERM
+trap 'f_cleanuptrap ; trap - SIGINT ; kill -s SIGINT $$' SIGINT
+# trap f_cleanuptrap SIGHUP SIGQUIT SIGABRT SIGTERM SIGINT
+
+IN_ARG="$1"
+IN_PARAMS_VALID="start stop restart status update update-validate console setup"
+
+# For anything other than initial setup or help, do some sanity checking and basic prereq.
+if [[ -n "$IN_ARG" ]] && [[ ! "$IN_ARG" =~ ^setup$|^help$ ]] ; then
+	# Require INSTALL_DIR to be present.
+	if [[ ! -d "$INSTALL_DIR" ]] ; then
+		echoerr ""
+		echoerr "ERROR: Server installation \"$INSTALL_DIR\" not found!"
+		echoerr "  If you want to perform setup for the first time, use the \"setup\" argument."
+		echoerr "  Be sure you have read the ${MYNAME}_README.txt file first!"
+		echoerr ""
+		exit 1
+	fi
+	# If the steam and steamcmd.sh binaries are not found, that is a problem.
+	if [[ ! -x "$STEAMCMD_BIN" ]] ; then
+		echoerr ""
+		echoerr "WARNING: Unable to find the SteamCMD installation."
+		STEAMCMD_MISSING=1
+	fi
+fi
+
+# tmux related prereq.
+if (type tmux &> /dev/null) ; then
+	# Get the tmux version.
+	TMUX_VER=$(tmux -V | egrep -o "[0-9].*[0-9]" 2> /dev/null)
+	# NOTE: The default tmux scrollback buffer is limited to 2000 lines. Define "history-limit" in your ~/.tmux.conf to change this.
+	# tmux capture-pane supports the -J argument from version 1.8 and on. This is very helpful. Use it if possible.
+	TMUX_VER_GT18_REGEX="^1\.[8-9]$|^1\.[1-9][0-9]$|^[2-9]+" # We want to match versions > 1.8
+	if [[ "$TMUX_VER" =~ $TMUX_VER_GT18_REGEX ]] ; then
+		TMUX_CAPTURE_OPTS="-S - -J"
+	else
+		TMUX_CAPTURE_OPTS="-S -"
+	fi
+	# Require tmux version 1.6 or later. This is because of the epoll/libevent bug which caused redirection hangs.
+	TMUX_VER_LT16_REGEX="^0\.[0-9]+|^1\.[0-5]$" # We want to match versions < 1.6
+	if [[ "$TMUX_VER" =~ $TMUX_VER_LT16_REGEX ]] ; then
+		echoerr ""
+		echoerr "ERROR: $MYNAME requires tmux version 1.6 or later."
+		echoerr ""
+		exit 1
+	fi
+fi
+
+# --
+
+case "$IN_ARG" in
+	'start')
+		f_start
+	;;
+	'stop')
+		f_stop
+	;;
+	'stopnow')
+		STOPNOW=yes
+		f_stop
+	;;
+	'restart')
+		f_stop
+		sleep 1
+		f_start
+	;;
+	'status')
+		f_status
+	;;
+	'update')
+		f_update
+	;;
+	'update-validate'|'update-verify-all')
+		VERIFYUPDATE=1
+		f_update
+	;;
+	'console')
+		f_tmuxattach
+	;;
+	'setup')
+		f_setup
+	;;
+	'--help'|'-help'|'help'|'-h')
+		f_help
+	;;
+	*)
+		echoerr ""
+		echoerr "Invalid argument."
+		f_commandusage
+		exit 1
+esac
+
