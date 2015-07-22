@@ -4,7 +4,7 @@
 
 _marvin()
 {
-	local cur prev opts base APPDIR SQLDBFILE SQLCMD LIST_INSTALLS
+	local cur prev opts base
 	COMPREPLY=()
 	cur="${COMP_WORDS[COMP_CWORD]}"
 	prev="${COMP_WORDS[COMP_CWORD-1]}"

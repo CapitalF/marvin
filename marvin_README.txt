@@ -93,7 +93,7 @@ marvin has a built-in dependency checker system as part of it's "setup" command.
 
 On a Debian GNU/Linux host, the following command should take care of installing most dependencies:
 
-# apt-get install lib32gcc1 coreutils util-linux procps wget tmux lsof findutils 
+# apt-get install lib32gcc1 tmux wget lsof sed coreutils grep findutils bsdutils util-linux procps
 
 
 
